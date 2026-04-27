@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Block Shift</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background:#0f0f13;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    height:100vh;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    color:#e8e8f0;
+    overflow:hidden;
+    user-select:none;
+  }
+  #hud {
+    display:flex;
+    gap:28px;
+    margin-bottom:12px;
+    font-size:13px;
+    font-weight:600;
+    color:#8888a0;
+    letter-spacing:0.5px;
+  }
+  #hud span { color:#e8e8f0; }
+  #timer-el.urgent { color:#f87171 !important; }
+  canvas {
+    display:block;
+    border-radius:12px;
+    border:1px solid rgba(255,255,255,0.08);
+    box-shadow:0 0 60px rgba(167,139,250,0.12);
+    cursor:pointer;
+  }
+  #overlay {
+    position:fixed;
+    inset:0;
+    background:rgba(15,15,19,0.88);
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    gap:14px;
+    backdrop-filter:blur(6px);
+  }
+  #overlay h2 {
+    font-size:32px;
+    font-weight:900;
+    letter-spacing:-1px;
+    background:linear-gradient(135deg,#fff 30%,#a78bfa);
+    -webkit-background-clip:text;
+    -webkit-text-fill-color:transparent;
+    background-clip:text;
+  }
+  #overlay p { color:#8888a0; font-size:13px; text-align:center; max-width:280px; line-height:1.6; }
+  #overlay button {
+    margin-top:6px;
+    padding:12px 36px;
+    background:linear-gradient(135deg,#7c6aff,#a855f7);
+    color:#fff;
+    border:none;
+    border-radius:8px;
+    font-size:15px;
+    font-weight:700;
+    cursor:pointer;
+    box-shadow:0 4px 20px rgba(124,106,255,0.4);
+    transition:transform 0.15s,box-shadow 0.15s;
+  }
+  #overlay button:hover { transform:translateY(-2px); box-shadow:0 8px 28px rgba(124,106,255,0.55); }
+  #overlay.hidden { display:none; }
+  #hint { font-size:11px; color:#555570; margin-top:-4px; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  Score <span id="score-el">0</span>
+  &nbsp;|&nbsp;
+  Level <span id="level-el">1</span>
+  &nbsp;|&nbsp;
+  Time <span id="timer-el">90</span>s
+  &nbsp;|&nbsp;
+  Need <span id="target-el">10</span>
+</div>
+
+<canvas id="c"></canvas>
+
+<div id="overlay">
+  <h2 id="ov-title">Block Shift</h2>
+  <p id="ov-sub">Click the arrows to shift rows &amp; columns.<br>Align 3 or more same-colored blocks to clear them!</p>
+  <button id="ov-btn">Start Game</button>
+</div>
+
+<script>
+const canvas  = document.getElementById('c');
+const ctx     = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const ovTitle = document.getElementById('ov-title');
+const ovSub   = document.getElementById('ov-sub');
+const ovBtn   = document.getElementById('ov-btn');
+const scoreEl = document.getElementById('score-el');
+const levelEl = document.getElementById('level-el');
+const timerEl = document.getElementById('timer-el');
+const targetEl = document.getElementById('target-el');
+
+// ── Canvas & grid layout ─────────────────────────────
+const CW = 480, CH = 460;
+canvas.width = CW; canvas.height = CH;
+
+const ROWS = 6, COLS = 6;
+const CELL = 56, GAP = 3;
+const GRID_W = COLS * (CELL + GAP) - GAP; // 351
+const GRID_H = ROWS * (CELL + GAP) - GAP; // 351
+const GX = Math.round((CW - GRID_W) / 2); // ~65
+const GY = Math.round((CH - GRID_H) / 2); // ~55
+const AR   = 14;  // arrow button radius
+const APAD = 7;   // gap from button edge to grid
+
+// ── Color palette ─────────────────────────────────────
+const COLORS = [
+  { fill:'#a78bfa', dark:'#7c5ef0', glow:'rgba(167,139,250,0.5)' },
+  { fill:'#38bdf8', dark:'#0ea5e9', glow:'rgba(56,189,248,0.5)'  },
+  { fill:'#f97316', dark:'#ea6a0a', glow:'rgba(249,115,22,0.5)'  },
+  { fill:'#06d6a0', dark:'#059669', glow:'rgba(6,214,160,0.5)'   },
+  { fill:'#f472b6', dark:'#ec4899', glow:'rgba(244,114,182,0.5)' },
+];
+
+// ── Game state ────────────────────────────────────────
+let grid = [];
+let state = 'idle';          // idle | playing | busy | gameover
+let score = 0, level = 1, timeLeft = 90;
+let clearedSets = 0, targetSets = 10;
+let busy = false;
+let popCells = [], popStart = 0;
+const POP_DUR = 380;
+let hoveredArrow = null;
+let timerInterval, rafId;
+
+// ── Grid helpers ──────────────────────────────────────
+function numColors() { return Math.min(3 + level, COLORS.length); }
+function cellX(c)    { return GX + c * (CELL + GAP); }
+function cellY(r)    { return GY + r * (CELL + GAP); }
+function randColor() { return Math.floor(Math.random() * numColors()); }
+
+function initGrid() {
+  grid = [];
+  for (let r = 0; r < ROWS; r++) {
+    grid[r] = [];
+    for (let c = 0; c < COLS; c++) grid[r][c] = randColor();
+  }
+}
+
+// ── Shift operations ──────────────────────────────────
+function shiftRowLeft(r)  { grid[r].push(grid[r].shift()); }
+function shiftRowRight(r) { grid[r].unshift(grid[r].pop()); }
+function shiftColUp(c) {
+  const top = grid[0][c];
+  for (let r = 0; r < ROWS-1; r++) grid[r][c] = grid[r+1][c];
+  grid[ROWS-1][c] = top;
+}
+function shiftColDown(c) {
+  const bot = grid[ROWS-1][c];
+  for (let r = ROWS-1; r > 0; r--) grid[r][c] = grid[r-1][c];
+  grid[0][c] = bot;
+}
+
+// ── Match detection ───────────────────────────────────
+function findMatches() {
+  const matched = Array.from({length:ROWS}, () => new Array(COLS).fill(false));
+  // rows
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; ) {
+      let run = 1;
+      while (c + run < COLS && grid[r][c+run] === grid[r][c]) run++;
+      if (run >= 3) for (let k = c; k < c+run; k++) matched[r][k] = true;
+      c += run;
+    }
+  }
+  // columns
+  for (let c = 0; c < COLS; c++) {
+    for (let r = 0; r < ROWS; ) {
+      let run = 1;
+      while (r + run < ROWS && grid[r+run][c] === grid[r][c]) run++;
+      if (run >= 3) for (let k = r; k < r+run; k++) matched[k][c] = true;
+      r += run;
+    }
+  }
+  return matched;
+}
+
+function countMatched(m) {
+  let n = 0;
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (m[r][c]) n++;
+  return n;
+}
+
+function applyGravity(matched) {
+  for (let c = 0; c < COLS; c++) {
+    let write = ROWS - 1;
+    for (let r = ROWS-1; r >= 0; r--) {
+      if (!matched[r][c]) { grid[write][c] = grid[r][c]; write--; }
+    }
+    for (let r = write; r >= 0; r--) grid[r][c] = randColor();
+  }
+}
+
+// ── Match processing (with pop animation) ────────────
+function processMatches() {
+  const matched = findMatches();
+  const n = countMatched(matched);
+  if (n === 0) { busy = false; return; }
+
+  // Score
+  const pts = n >= 6 ? n * 25 : n >= 4 ? n * 15 : n * 10;
+  score += pts * level;
+
+  // Time bonus
+  timeLeft = Math.min(99, timeLeft + (n >= 6 ? 6 : n >= 4 ? 4 : 2));
+
+  // Accumulate cleared sets
+  clearedSets++;
+  updateHud();
+
+  // Record cells to pop
+  popCells = [];
+  for (let r = 0; r < ROWS; r++)
+    for (let c = 0; c < COLS; c++)
+      if (matched[r][c]) popCells.push({r, c, color: grid[r][c]});
+  popStart = performance.now();
+
+  setTimeout(() => {
+    applyGravity(matched);
+    popCells = [];
+
+    // Level up
+    if (clearedSets >= targetSets) {
+      level++;
+      clearedSets = 0;
+      targetSets = 10 + level * 2;
+      timeLeft = Math.min(99, timeLeft + 15);
+      initGrid();
+      updateHud();
+    }
+
+    // Chain check
+    setTimeout(() => processMatches(), 60);
+  }, POP_DUR);
+}
+
+// ── Arrow hit-test ─────────────────────────────────────
+function arrowPositions() {
+  const arrows = [];
+  for (let r = 0; r < ROWS; r++) {
+    const cy = cellY(r) + CELL/2;
+    arrows.push({type:'row', r, dir:'left',  x: GX - APAD - AR,          y: cy });
+    arrows.push({type:'row', r, dir:'right', x: GX + GRID_W + APAD + AR, y: cy });
+  }
+  for (let c = 0; c < COLS; c++) {
+    const cx = cellX(c) + CELL/2;
+    arrows.push({type:'col', c, dir:'up',   x: cx, y: GY - APAD - AR          });
+    arrows.push({type:'col', c, dir:'down', x: cx, y: GY + GRID_H + APAD + AR });
+  }
+  return arrows;
+}
+
+function getArrowAt(px, py) {
+  for (const a of arrowPositions()) {
+    if (Math.hypot(px - a.x, py - a.y) <= AR + 5) return a;
+  }
+  return null;
+}
+
+// ── Input ──────────────────────────────────────────────
+function handleClick(px, py) {
+  if (state !== 'playing' || busy) return;
+  const a = getArrowAt(px, py);
+  if (!a) return;
+
+  if (a.type === 'row') {
+    if (a.dir === 'left')  shiftRowLeft(a.r);
+    else                   shiftRowRight(a.r);
+  } else {
+    if (a.dir === 'up')    shiftColUp(a.c);
+    else                   shiftColDown(a.c);
+  }
+
+  busy = true;
+  setTimeout(() => processMatches(), 50);
+}
+
+function toCanvasCoords(e, touch) {
+  const rect = canvas.getBoundingClientRect();
+  const src  = touch || e;
+  return {
+    x: (src.clientX - rect.left) * (CW / rect.width),
+    y: (src.clientY - rect.top)  * (CH / rect.height),
+  };
+}
+
+canvas.addEventListener('click',      e => { const p = toCanvasCoords(e); handleClick(p.x, p.y); });
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  const p = toCanvasCoords(e, e.touches[0]);
+  handleClick(p.x, p.y);
+}, { passive:false });
+canvas.addEventListener('mousemove',  e => {
+  const p = toCanvasCoords(e);
+  hoveredArrow = state === 'playing' ? getArrowAt(p.x, p.y) : null;
+});
+canvas.addEventListener('mouseleave', () => { hoveredArrow = null; });
+
+ovBtn.addEventListener('click', startGame);
+
+// ── Game control ──────────────────────────────────────
+function startGame() {
+  score = 0; level = 1; timeLeft = 90;
+  clearedSets = 0; targetSets = 10;
+  busy = false; popCells = [];
+  initGrid();
+  updateHud();
+  overlay.classList.add('hidden');
+  state = 'playing';
+  if (timerInterval) clearInterval(timerInterval);
+  timerInterval = setInterval(tickTimer, 1000);
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = requestAnimationFrame(loop);
+}
+
+function tickTimer() {
+  if (state !== 'playing') return;
+  timeLeft--;
+  timerEl.classList.toggle('urgent', timeLeft <= 15);
+  if (timeLeft <= 0) { timeLeft = 0; endGame(); }
+  updateHud();
+}
+
+function endGame() {
+  state = 'gameover';
+  clearInterval(timerInterval);
+  ovTitle.textContent = 'Time Up!';
+  ovSub.textContent   = `Final Score: ${score}  —  Level ${level}`;
+  ovBtn.textContent   = 'Play Again';
+  overlay.classList.remove('hidden');
+}
+
+function updateHud() {
+  scoreEl.textContent  = score;
+  levelEl.textContent  = level;
+  timerEl.textContent  = timeLeft;
+  targetEl.textContent = Math.max(0, targetSets - clearedSets);
+}
+
+// ── Rendering ─────────────────────────────────────────
+function drawBg() {
+  ctx.fillStyle = '#18181f';
+  ctx.fillRect(0, 0, CW, CH);
+
+  // Subtle grid area glow
+  ctx.save();
+  ctx.shadowColor = 'rgba(167,139,250,0.06)';
+  ctx.shadowBlur  = 40;
+  ctx.fillStyle   = 'rgba(255,255,255,0.025)';
+  ctx.beginPath();
+  ctx.roundRect(GX - 6, GY - 6, GRID_W + 12, GRID_H + 12, 10);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawArrowBtn(ax, ay, dir, hovered) {
+  ctx.save();
+  // Circle bg
+  ctx.fillStyle   = hovered ? 'rgba(167,139,250,0.25)' : 'rgba(255,255,255,0.06)';
+  ctx.strokeStyle = hovered ? '#a78bfa'                 : 'rgba(255,255,255,0.12)';
+  ctx.lineWidth   = 1.5;
+  ctx.beginPath();
+  ctx.arc(ax, ay, AR, 0, Math.PI*2);
+  ctx.fill();
+  ctx.stroke();
+
+  // Triangle arrow
+  ctx.fillStyle = hovered ? '#e8e8f0' : '#666680';
+  ctx.beginPath();
+  const s = 6;
+  switch (dir) {
+    case 'left':  ctx.moveTo(ax-s,ay); ctx.lineTo(ax+s*.6,ay-s*.8); ctx.lineTo(ax+s*.6,ay+s*.8); break;
+    case 'right': ctx.moveTo(ax+s,ay); ctx.lineTo(ax-s*.6,ay-s*.8); ctx.lineTo(ax-s*.6,ay+s*.8); break;
+    case 'up':    ctx.moveTo(ax,ay-s); ctx.lineTo(ax+s*.8,ay+s*.6); ctx.lineTo(ax-s*.8,ay+s*.6); break;
+    case 'down':  ctx.moveTo(ax,ay+s); ctx.lineTo(ax+s*.8,ay-s*.6); ctx.lineTo(ax-s*.8,ay-s*.6); break;
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawArrows() {
+  const arrows = arrowPositions();
+  for (const a of arrows) {
+    const hov = hoveredArrow &&
+      hoveredArrow.type === a.type &&
+      hoveredArrow.dir  === a.dir  &&
+      (a.type === 'row' ? hoveredArrow.r === a.r : hoveredArrow.c === a.c);
+    drawArrowBtn(a.x, a.y, a.dir, hov);
+  }
+}
+
+function drawGrid() {
+  const now = performance.now();
+  const popSet = new Set(popCells.map(p => `${p.r},${p.c}`));
+  const popT   = popCells.length ? Math.min(1, (now - popStart) / POP_DUR) : 1;
+
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const ci = grid[r][c];
+      if (ci < 0 || ci >= COLORS.length) continue;
+      const col   = COLORS[ci];
+      const x     = cellX(c);
+      const y     = cellY(r);
+      const isPop = popSet.has(`${r},${c}`);
+
+      ctx.save();
+
+      if (isPop) {
+        // Scale-out + fade
+        const s = 1 + popT * 0.45;
+        ctx.globalAlpha = 1 - popT;
+        ctx.translate(x + CELL/2, y + CELL/2);
+        ctx.scale(s, s);
+        ctx.translate(-(x + CELL/2), -(y + CELL/2));
+        ctx.shadowColor = col.glow;
+        ctx.shadowBlur  = 18 + popT * 20;
+      } else {
+        ctx.shadowColor = col.glow;
+        ctx.shadowBlur  = 6;
+      }
+
+      // Block body
+      const grad = ctx.createLinearGradient(x, y, x, y + CELL);
+      grad.addColorStop(0, col.fill);
+      grad.addColorStop(1, col.dark);
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.roundRect(x, y, CELL, CELL, 7);
+      ctx.fill();
+
+      ctx.shadowBlur = 0;
+
+      // Top highlight
+      ctx.fillStyle = 'rgba(255,255,255,0.22)';
+      ctx.beginPath();
+      ctx.roundRect(x + 4, y + 3, CELL - 8, 7, 4);
+      ctx.fill();
+
+      // Bottom shade
+      ctx.fillStyle = 'rgba(0,0,0,0.18)';
+      ctx.beginPath();
+      ctx.roundRect(x + 4, y + CELL - 8, CELL - 8, 5, 3);
+      ctx.fill();
+
+      ctx.restore();
+    }
+  }
+}
+
+function loop() {
+  drawBg();
+  drawArrows();
+  drawGrid();
+  rafId = requestAnimationFrame(loop);
+}
+
+// Initial static render
+drawBg();
+</script>
+</body>
+</html>
